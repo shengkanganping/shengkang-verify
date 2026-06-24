@@ -1,0 +1,8 @@
+flask
+anthropic
+pandas
+xlrd
+openpyxl
+pdf2image
+pillow
+gunicorn
