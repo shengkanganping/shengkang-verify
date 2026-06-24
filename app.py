@@ -1,4 +1,4 @@
-# 勝康居家長照 - 服務紀錄核對系統（網頁版）
+# 勝康居家長照 - 服務紀錄核對系統（網頁版）v2
 from flask import Flask, request, jsonify, render_template_string
 import os, io, re, json, base64, tempfile
 from werkzeug.utils import secure_filename
@@ -193,7 +193,7 @@ function showResults(report) {
 function exportCSV() {
   const headers = ['個案姓名','BA項目','照管家次數','紙本次數','結果'];
   const rows = reportData.map(r => headers.map(h => r[h]).join(','));
-  const csv = '\ufeff' + headers.join(',') + '\\n' + rows.join('\\n');
+  const csv = '\\ufeff' + headers.join(',') + '\\n' + rows.join('\\n');
   const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -227,48 +227,79 @@ def verify():
     if not excel_file or not pdf_files:
         return jsonify({'error': '請上傳 Excel 和 PDF'}), 400
 
-    # 讀 Excel
+    # ── 讀 Excel ──────────────────────────────────────────────
     try:
         excel_bytes = excel_file.read()
-        for engine in ['xlrd','openpyxl']:
+        df = None
+        for engine in ['xlrd', 'openpyxl']:
             try:
                 df = pd.read_excel(io.BytesIO(excel_bytes), header=None, engine=engine)
                 break
-            except: continue
+            except:
+                continue
+        if df is None:
+            return jsonify({'error': 'Excel 讀取失敗，請確認檔案格式'}), 500
 
         header_row = -1
         for i, row in df.iterrows():
-            if '個案姓名' in [str(v) for v in row.values] and '次數' in [str(v) for v in row.values]:
-                header_row = i; break
+            vals = [str(v) for v in row.values]
+            if '個案姓名' in vals and '次數' in vals:
+                header_row = i
+                break
+
+        if header_row == -1:
+            return jsonify({'error': 'Excel 找不到標題列（需含「個案姓名」和「次數」欄）'}), 500
 
         df.columns = df.iloc[header_row]
-        df = df.iloc[header_row+1:].reset_index(drop=True)
+        df = df.iloc[header_row + 1:].reset_index(drop=True)
 
         excel_data = {}
         for _, row in df.iterrows():
-            name = str(row.get('個案姓名','')).strip()
-            code = str(row.get('服務項目代碼','')).strip()
+            name  = str(row.get('個案姓名', '')).strip()
+            code  = str(row.get('服務項目代碼', '')).strip()
             count = row.get('次數', 0)
-            if not name or not code or name in ['合計','總計','nan']: continue
-            code = re.sub(r'\[補助\]|\[自費\]','',code).strip().upper()
-            try: count = int(float(count))
-            except: count = 0
-            if name not in excel_data: excel_data[name] = {}
-            excel_data[name][code] = excel_data[name].get(code,0) + count
+            if not name or not code or name in ['合計', '總計', 'nan']:
+                continue
+            code = re.sub(r'\[補助\]|\[自費\]', '', code).strip().upper()
+            try:
+                count = int(float(count))
+            except:
+                count = 0
+            if count <= 0:
+                continue
+            if name not in excel_data:
+                excel_data[name] = {}
+            excel_data[name][code] = excel_data[name].get(code, 0) + count
 
         known_names = set(excel_data.keys())
-        logs.append(f'📊 Excel 讀取完成：{len(excel_data)} 位個案（{", ".join(known_names)}）')
+        logs.append(f'📊 Excel 讀取完成：{len(excel_data)} 位個案（{", ".join(sorted(known_names))}）')
     except Exception as e:
         return jsonify({'error': f'Excel 讀取失敗：{e}'}), 500
 
-    # 處理 PDF
-    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    pdf_results = {}
-    known_str = '、'.join(known_names)
+    # ── 處理 PDF ──────────────────────────────────────────────
+    client   = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    pdf_results = {}   # {個案姓名: {BA碼: 累計次數}}
+    known_str = '、'.join(sorted(known_names))
+
+    def match_name(raw):
+        """從已知名單找最相符的個案姓名"""
+        raw = (raw or '').strip()
+        if raw in known_names:
+            return raw
+        # 允許1字不同（模糊比對）
+        for kn in known_names:
+            if len(raw) == len(kn) and sum(a != b for a, b in zip(raw, kn)) <= 1:
+                return kn
+        return None
 
     for pdf_file in pdf_files:
         pdf_name = pdf_file.filename
         logs.append(f'📄 處理：{pdf_name}')
+
+        # 從檔名預先猜測個案姓名（如「薛東發5月.pdf」→「薛東發」）
+        stem = re.split(r'[\d_\-年月]', os.path.splitext(pdf_name)[0])[0]
+        name_from_filename = match_name(stem)
+
         try:
             pdf_bytes = pdf_file.read()
             images = convert_from_bytes(pdf_bytes, dpi=150)
@@ -276,91 +307,125 @@ def verify():
             logs.append(f'  ✗ PDF 轉圖失敗：{e}')
             continue
 
-        current_name = None
+        # 逐頁處理，current_name 在整份 PDF 內持續傳遞
+        # 但每頁都讓 AI 重新辨識姓名，以確保多個案 PDF 正確切換
+        current_name = name_from_filename  # 先用檔名當預設
+
         for page_num, image in enumerate(images, 1):
             try:
                 buf = io.BytesIO()
                 image.save(buf, format='JPEG', quality=80)
                 img_b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
 
-                prompt = f"""這是一份居家服務紀錄單的掃描圖片。
+                prompt = f"""這是居家服務紀錄單的掃描圖片，請仔細辨識後，用 JSON 格式回傳以下資訊。
 
-請判斷並回傳以下資訊：
+【判斷說明】
+1. is_summary（布林值）：
+   - true = 這頁表格最右側有一欄標題是「總計組數次數」，且有數字
+   - false = 正面（沒有總計欄，只有日期欄位）
 
-1. 這頁有沒有「總計組數次數」欄？
-   - 表格最右側有一欄標題寫「總計組數次數」→ is_summary: true
-   - 沒有這欄 → is_summary: false
+2. 姓名：表格左上角「姓名」欄旁邊寫的個案姓名。
+   請從已知名單中選最接近的：【{known_str}】
+   若辨識不出來請填 null。
 
-2. 找「姓名」欄位旁邊的個案姓名，從已知名單選最相符的：{known_str}
+3. 總計（只在 is_summary=true 時填寫）：
+   讀取最右側「總計」欄每個 BA 項目旁的數字。
+   只列出數字大於 0 的項目。
+   注意手寫數字：8 和 3 容易混淆、1 和 7 容易混淆。
 
-3. 如果有總計欄，讀出每個BA項目的總計次數（只讀最右側總計欄）
-
-請用以下 JSON 格式回傳：
+請只回傳 JSON，不要其他說明：
 {{
-  "is_summary": true,
-  "姓名": "從已知名單選一個",
-  "總計": {{"BA03": 10, "BA07": 6}}
-}}
-
-注意：
-- 姓名必須從已知名單 [{known_str}] 中選
-- 只列出總計大於0的BA項目
-- 手寫數字注意：8和5容易混淆
-- is_summary 為 false 時總計填空的 {{}}"""
+  "is_summary": true 或 false,
+  "姓名": "個案姓名或 null",
+  "總計": {{"BA03": 18, "BA07": 6}}
+}}"""
 
                 response = client.messages.create(
                     model="claude-sonnet-4-6",
-                    max_tokens=1000,
-                    messages=[{"role":"user","content":[
-                        {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":img_b64}},
-                        {"type":"text","text":prompt}
+                    max_tokens=1500,
+                    messages=[{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "text", "text": prompt}
                     ]}]
                 )
 
-                text = re.sub(r'```json|```','',response.content[0].text).strip()
-                data = json.loads(text)
-                is_summary = data.get('is_summary', False)
-                name = (data.get('姓名','') or '').strip()
-                totals = {k.upper(): int(v) for k,v in (data.get('總計',{}) or {}).items()
-                          if str(v).isdigit() and int(v) > 0}
-
-                if name in known_names:
-                    current_name = name
-                elif name:
-                    for kn in known_names:
-                        if len(name)==len(kn) and sum(a!=b for a,b in zip(name,kn))<=1:
-                            current_name = kn; break
-
-                if not is_summary:
-                    logs.append(f'  第{page_num}頁：正面（跳過）')
+                # 記錄 stop_reason 幫助除錯
+                stop_reason = response.stop_reason
+                if not response.content:
+                    logs.append(f'  第{page_num}頁 API 回傳空內容，stop_reason={stop_reason}')
                     continue
 
-                logs.append(f'  第{page_num}頁：總計頁，個案={current_name}，{len(totals)}項')
+                raw_text = response.content[0].text.strip()
+                logs.append(f'  第{page_num}頁 API原文（前80字）：{raw_text[:80]}')
+                # 清除 markdown 包裝
+                clean = re.sub(r'```json|```', '', raw_text).strip()
+                data = json.loads(clean)
 
-                if current_name and totals:
-                    if current_name not in pdf_results: pdf_results[current_name] = {}
-                    for code, count in totals.items():
-                        pdf_results[current_name][code] = pdf_results[current_name].get(code,0) + count
+                is_summary  = bool(data.get('is_summary', False))
+                name_ai     = data.get('姓名') or ''
+                totals      = data.get('總計') or {}
 
+                # 更新 current_name（每頁都嘗試，不只總計頁）
+                matched = match_name(name_ai)
+                if matched:
+                    current_name = matched
+
+                if not is_summary:
+                    logs.append(f'  第{page_num}頁：正面（個案={current_name}，跳過）')
+                    continue
+
+                # 總計頁：把數字累加進 pdf_results
+                valid_totals = {}
+                for code, val in totals.items():
+                    try:
+                        n = int(str(val).strip())
+                        if n > 0:
+                            valid_totals[code.upper()] = n
+                    except:
+                        pass
+
+                logs.append(f'  第{page_num}頁：總計頁，個案={current_name}，讀到{len(valid_totals)}項 → {valid_totals}')
+
+                if current_name and valid_totals:
+                    if current_name not in pdf_results:
+                        pdf_results[current_name] = {}
+                    for code, count in valid_totals.items():
+                        pdf_results[current_name][code] = pdf_results[current_name].get(code, 0) + count
+
+            except json.JSONDecodeError as e:
+                logs.append(f'  第{page_num}頁 JSON 解析失敗：{e}｜原文：{raw_text[:100]}')
             except Exception as e:
                 logs.append(f'  第{page_num}頁失敗：{e}')
 
-    # 比對
+    # ── 比對 ──────────────────────────────────────────────────
     report = []
-    excel_norm = {n:{k.upper():v for k,v in items.items()} for n,items in excel_data.items()}
-    pdf_norm   = {n:{k.upper():v for k,v in items.items()} for n,items in pdf_results.items()}
+    for case_name in sorted(set(excel_data) | set(pdf_results)):
+        ei = {k.upper(): v for k, v in excel_data.get(case_name, {}).items()}
+        pi = {k.upper(): v for k, v in pdf_results.get(case_name, {}).items()}
+        for code in sorted(set(ei) | set(pi)):
+            exp = ei.get(code, 0)
+            act = pi.get(code)
+            if act is None:
+                status = '⚠ 紙本未讀到'
+            elif act == exp:
+                status = '✅ 符合'
+            else:
+                status = '❌ 差異'
+            report.append({
+                '個案姓名': case_name,
+                'BA項目':   code,
+                '照管家次數': exp,
+                '紙本次數':  act if act is not None else '',
+                '結果':      status
+            })
 
-    for case_name in sorted(set(excel_norm)|set(pdf_norm)):
-        ei = excel_norm.get(case_name,{})
-        pi = pdf_norm.get(case_name,{})
-        for code in sorted(set(ei)|set(pi)):
-            exp = ei.get(code,0)
-            act = pi.get(code,None)
-            status = '⚠ 紙本未讀到' if act is None else ('✅ 符合' if act==exp else '❌ 差異')
-            report.append({'個案姓名':case_name,'BA項目':code,
-                           '照管家次數':exp,'紙本次數':act if act is not None else '','結果':status})
+    ok_cnt   = sum(1 for r in report if '符合' in r['結果'])
+    ng_cnt   = sum(1 for r in report if '差異' in r['結果'])
+    warn_cnt = sum(1 for r in report if '未讀' in r['結果'])
+    logs.append(f'📋 比對完成：符合{ok_cnt}項 / 差異{ng_cnt}項 / 待確認{warn_cnt}項')
 
     return jsonify({'logs': logs, 'report': report})
+
 
 if __name__ == '__main__':
     app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
